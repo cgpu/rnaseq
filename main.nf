@@ -21,6 +21,10 @@ def helpMessage() {
 
     Mandatory arguments:
       --reads [file]                Path to input data (must be surrounded with quotes)
+      --accessionList [file]        Path to input file with accession list to fetch from SRA
+                                    Alternative to --reads. Define SRA samples to be retrieved.
+                                    NOTE: If provided, it will override the --reads parameter.
+
       -profile [str]                Configuration profile to use. Can use multiple (comma separated)
                                     Available: conda, docker, singularity, test, awsbatch, <institute> and more
 
@@ -90,6 +94,8 @@ def helpMessage() {
       --skipMultiQC                 Skip MultiQC
 
     Other options:
+      --keyFile                     Path to a keyfile used to fetch restricted access datasets with SRAtools
+                                    NOTE: Conditionally required, when --accessionList is provided and includes restricted access SRA samples.
       --sampleLevel                 Used to turn off the edgeR MDS and heatmap. Set automatically when running on fewer than 3 samples
       --outdir                      The output directory where the results will be saved
       -w/--work-dir                 The temporary directory where intermediate data will be saved
@@ -144,6 +150,7 @@ three_prime_clip_r2 = params.three_prime_clip_r2
 forwardStranded = params.forwardStranded
 reverseStranded = params.reverseStranded
 unStranded = params.unStranded
+key_file   = file(params.keyFile)
 
 // Preset trimming options
 if (params.pico) {
@@ -277,7 +284,7 @@ if (params.rsem_reference && !params.skip_rsem && !params.skipAlignment) {
     } else {
         Channel.fromPath(params.fasta, checkIfExists: true)
             .ifEmpty { exit 1, "Genome fasta file not found: ${params.fasta}" }
-            .into { ch_fasta_for_rsem_reference }
+            .set { ch_fasta_for_rsem_reference }
     }
 } else if (params.skip_rsem || params.skipAlignment) {
     println "Skipping RSEM ..."
@@ -361,36 +368,69 @@ ch_multiqc_custom_config = params.multiqc_config ? Channel.fromPath(params.multi
 ch_output_docs = file("$params.assetsDir/docs/output.md", checkIfExists: true)
 
 /*
- * Create a channel for input read files
+ * Create a channel for input read files, from path or by retrieving from SRA
  */
-if (params.readPaths) {
-    if (params.single_end) {
+
+if(!params.accessionList) {
+    if (params.readPaths && params.single_end) {
         Channel
             .from(params.readPaths)
             .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true) ] ] }
             .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-            .into { raw_reads_fastqc; raw_reads_trimgalore }
-    } else {
+            .into { raw_reads_inspect ; raw_reads_fastqc; raw_reads_trimgalore }
+    }
+    if (params.readPaths && !params.single_end) {
         Channel
             .from(params.readPaths)
             .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true), file(row[1][1], checkIfExists: true) ] ] }
             .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-            .into { raw_reads_fastqc; raw_reads_trimgalore }
+            .into { raw_reads_inspect ; raw_reads_fastqc; raw_reads_trimgalore }
     }
-} else {
-    Channel
-        .fromFilePairs( params.reads, size: params.single_end ? 1 : 2 )
-        .ifEmpty { exit 1, "Cannot find any reads matching: ${params.reads}\nNB: Path needs to be enclosed in quotes!\nNB: Path requires at least one * wildcard!\nIf this is single-end data, please specify --single_end on the command line." }
-        .into { raw_reads_fastqc; raw_reads_trimgalore }
+    if (params.reads) {
+        Channel
+            .fromFilePairs( params.reads, size: params.single_end ? 1 : 2 )
+            .ifEmpty { exit 1, "Cannot find any reads matching: ${params.reads}\nNB: Path needs to be enclosed in quotes!\nNB: Path requires at least one * wildcard!\nIf this is single-end data, please specify --single_end on the command line." }
+            .into { raw_reads_inspect ; raw_reads_fastqc; raw_reads_trimgalore }
+    }
+
+raw_reads_inspect.view()
 }
+
+if(params.accessionList) {
+    Channel
+        .fromPath( params.accessionList )
+        .splitText()
+        .map{ it.trim() }
+        .dump(tag: 'AccessionList content')
+        .ifEmpty { exit 1, "Accession list file not found in the location defined by --accessionList. Is the file path correct?" }
+        .into { accessionIDs_inspect ; accessionIDs }
+
+    accessionIDs_inspect.view()
+}
+
+
+/*
+ *  Create channel for the HBA-DEALS metadata contrasts
+ */
+
+// Input list .csv file of many .csv files
+if (params.hbadeals_metadata.endsWith(".csv")) {
+  Channel.fromPath(params.hbadeals_metadata)
+                        .ifEmpty { exit 1, "Input master file .csv of .csv metadata files not found at ${params.hbadeals_metadata} or the suffix is not .csv. Is the file path correct?" }
+                        .splitCsv(sep: ',' , skip: 1)
+                        .map { unique_id, path -> tuple("contrast_"+unique_id, file(path)) }
+                        .set { ch_hbadeals_metadata }
+  }
 
 // Header log info
 log.info nfcoreHeader()
 def summary = [:]
 if (workflow.revision) summary['Pipeline Release'] = workflow.revision
 summary['Run Name'] = custom_runName ?: workflow.runName
-summary['Reads'] = params.reads
+if (!params.accessionList) summary['Reads'] = params.reads
 summary['Data Type'] = params.single_end ? 'Single-End' : 'Paired-End'
+if (params.accessionList) summary['SRA accession '] = params.accessionList
+if (params.accessionList && (params.keyFile != "NO_FILE") ) summary['SRAtools key file '] = params.keyFile
 if (params.genome) summary['Genome'] = params.genome
 if (params.pico) summary['Library Prep'] = "SMARTer Stranded Total RNA-Seq Kit - Pico Input"
 summary['Strandedness'] = (unStranded ? 'None' : forwardStranded ? 'Forward' : reverseStranded ? 'Reverse' : 'None')
@@ -880,6 +920,35 @@ if (params.pseudo_aligner == 'salmon' && !params.salmon_index) {
         """
     }
 }
+
+
+/*
+ * STEP  - Get accession samples from SRA with or without keyFile
+ */
+
+if (params.accessionList) {
+
+    process getAccession {
+        tag "${accession}"
+        
+        input:
+        val(accession) from accessionIDs
+        file keyFile from key_file
+        
+        output:
+        set val(accession), file("*.fastq.gz") into (raw_reads_inspect, raw_reads_fastqc, raw_reads_trimgalore)
+        
+        script:
+        def vdbConfigCmd = keyFile.name != 'NO_FILE' ? "vdb-config --import ${keyFile} ./" : ''
+        """
+        $vdbConfigCmd
+        fasterq-dump $accession --threads ${task.cpus} --split-3
+        pigz *.fastq
+        """
+    }
+    raw_reads_inspect.view()
+}
+
 
 /*
  * STEP 1 - FastQC
@@ -1521,7 +1590,7 @@ if (!params.skipAlignment) {
 
             output:
                 file("*.genes.results") into rsem_results_genes
-                file("*.isoforms.results") into rsem_results_isoforms
+                file("*.isoforms.results") into (rsem_results_isoforms, rsem_results_isoforms_hbadeals)
                 file("*.stat") into rsem_logs
 
             script:
@@ -1539,7 +1608,6 @@ if (!params.skipAlignment) {
             ${sample_name}
             """
     }
-
 
     /**
     * Step 12 - merge RSEM TPM
@@ -1576,6 +1644,40 @@ if (!params.skipAlignment) {
         paste transcript_ids.txt tmp_isoforms/*.tpm.txt > rsem_tpm_isoform.txt
         """
     }
+
+    /**
+     * Step HBA-DEALS
+     */
+    process hbadeals {
+            tag "${contrast_id}"
+            label "hbadeals"
+            publishDir "${params.outdir}/hbadeals", mode: "${params.publish_dir_mode}"
+
+            input:
+                set val(contrast_id), file(metadata) from ch_hbadeals_metadata
+                file("*") from rsem_results_isoforms_hbadeals.collect()
+
+            output:
+                file("${contrast_id}.csv") into hbadeals_results_isoforms
+
+            when:
+            !params.skip_rsem && !params.skip_hbadeals
+
+
+            script:
+            """
+            rsem2hbadeals.R \
+            --rsem_folder='.' \
+            --metadata=$metadata \
+            --rsem_file_suffix=$params.rsem_file_suffix \
+            --output=$contrast_id \
+            --isoform_level=$params.isoform_level \
+            --mcmc_iter=$params.mcmc_iter \
+            --mcmc_warmup=$params.mcmc_warmup \
+            --n_cores=${task.cpus}
+            """
+    }
+
   } else {
       rsem_logs = Channel.from(false)
   }
